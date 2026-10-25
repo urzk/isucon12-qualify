@@ -153,15 +153,20 @@ const idBlockSize = 1000
 let nextID = 1
 let maxID = 0
 let reservingIDBlock: Promise<void> | undefined
+// 初期化で id_generator が巻き戻るので、初期化前に確保を始めた範囲は使わない
+let idBlockGeneration = 0
 
 async function reserveIDBlock(): Promise<void> {
+  const generation = idBlockGeneration
   try {
     const [result] = await adminDB.execute<OkPacket>(
       'UPDATE id_generator SET id = LAST_INSERT_ID(id + ?) WHERE stub = ?',
       [idBlockSize, 'a']
     )
-    maxID = result.insertId
-    nextID = maxID - idBlockSize + 1
+    if (generation === idBlockGeneration) {
+      maxID = result.insertId
+      nextID = maxID - idBlockSize + 1
+    }
   } catch (error) {
     throw new Error(`error UPDATE id_generator: ${error}`)
   }
@@ -180,6 +185,8 @@ async function dispenseID(): Promise<string> {
 }
 
 function resetIDBlock() {
+  idBlockGeneration++
+  reservingIDBlock = undefined
   nextID = 1
   maxID = 0
 }
@@ -522,11 +529,61 @@ async function retrieveTenantRowFromHeader(req: Request): Promise<TenantRow | un
   }
 }
 
+// DBから読んだ値のプロセス内キャッシュ
+// 値を変更したら invalidate する。読み込み中に invalidate された場合は古い値をキャッシュしないよう、
+// 読み込み開始時の世代と比較してからキャッシュする。存在しない(undefined)結果はキャッシュしない
+// キャッシュした値は共有されるので、呼び出し側で変更しないこと
+class VersionedCache<V> {
+  private values = new Map<string, V>()
+  private generations = new Map<string, number>()
+  private epoch = 0
+
+  async get(key: string, load: () => Promise<V | undefined>): Promise<V | undefined> {
+    const cached = this.values.get(key)
+    if (cached !== undefined) {
+      return cached
+    }
+
+    const epoch = this.epoch
+    const generation = this.generations.get(key) ?? 0
+    const value = await load()
+    if (value !== undefined && epoch === this.epoch && generation === (this.generations.get(key) ?? 0)) {
+      this.values.set(key, value)
+    }
+    return value
+  }
+
+  invalidate(key: string) {
+    this.generations.set(key, (this.generations.get(key) ?? 0) + 1)
+    this.values.delete(key)
+  }
+
+  clear() {
+    this.epoch++
+    this.values.clear()
+  }
+}
+
+// 参加者・大会のキャッシュ
+// 参加者は失格時、大会は追加・終了時に invalidate する
+const playerCache = new VersionedCache<PlayerRow>()
+const competitionCache = new VersionedCache<CompetitionRow>()
+const competitionListCache = new VersionedCache<CompetitionRow[]>()
+
+function invalidateCompetitions(tenantId: number, competitionId?: string) {
+  if (competitionId) {
+    competitionCache.invalidate(`${tenantId}:${competitionId}`)
+  }
+  competitionListCache.invalidate(`${tenantId}:DESC`)
+  competitionListCache.invalidate(`${tenantId}:ASC`)
+}
+
 // 参加者を取得する
-async function retrievePlayer(tenantDB: Database, id: string): Promise<PlayerRow | undefined> {
+async function retrievePlayer(tenantDB: Database, tenantId: number, id: string): Promise<PlayerRow | undefined> {
   try {
-    const playerRow = await tenantDB.get<PlayerRow>('SELECT * FROM player WHERE id = ?', id)
-    return playerRow
+    return await playerCache.get(`${tenantId}:${id}`, () =>
+      tenantDB.get<PlayerRow>('SELECT * FROM player WHERE id = ?', id)
+    )
   } catch (error) {
     throw new Error(`error Select player: id=${id}, ${error}`)
   }
@@ -534,8 +591,8 @@ async function retrievePlayer(tenantDB: Database, id: string): Promise<PlayerRow
 
 // 参加者を認可する
 // 参加者向けAPIで呼ばれる
-async function authorizePlayer(tenantDB: Database, id: string): Promise<void> {
-  const player = await retrievePlayer(tenantDB, id)
+async function authorizePlayer(tenantDB: Database, tenantId: number, id: string): Promise<void> {
+  const player = await retrievePlayer(tenantDB, tenantId, id)
   if (!player) {
     throw new ErrorWithStatus(401, 'player not found')
   }
@@ -545,21 +602,33 @@ async function authorizePlayer(tenantDB: Database, id: string): Promise<void> {
 }
 
 // 大会を取得する
-async function retrieveCompetition(tenantDB: Database, id: string): Promise<CompetitionRow | undefined> {
+async function retrieveCompetition(
+  tenantDB: Database,
+  tenantId: number,
+  id: string
+): Promise<CompetitionRow | undefined> {
   try {
-    const competitionRow = await tenantDB.get<CompetitionRow>('SELECT * FROM competition WHERE id = ?', id)
-    return competitionRow
+    return await competitionCache.get(`${tenantId}:${id}`, () =>
+      tenantDB.get<CompetitionRow>('SELECT * FROM competition WHERE id = ?', id)
+    )
   } catch (error) {
     throw new Error(`error Select competition: id=${id}, ${error}`)
   }
 }
 
-// 大会の一覧を新しい順に取得する
-async function listCompetitions(tenantDB: Database, tenantId: number): Promise<CompetitionRow[]> {
-  return tenantDB.all<CompetitionRow[]>(
-    'SELECT * FROM competition WHERE tenant_id = ? ORDER BY created_at DESC',
-    tenantId
+// 大会の一覧を作成日時順に取得する (デフォルトは新しい順)
+async function listCompetitions(
+  tenantDB: Database,
+  tenantId: number,
+  order: 'ASC' | 'DESC' = 'DESC'
+): Promise<CompetitionRow[]> {
+  const competitions = await competitionListCache.get(`${tenantId}:${order}`, () =>
+    tenantDB.all<CompetitionRow[]>(
+      `SELECT * FROM competition WHERE tenant_id = ? ORDER BY created_at ${order === 'ASC' ? 'ASC' : 'DESC'}`,
+      tenantId
+    )
   )
+  return competitions ?? []
 }
 
 // SQL の IN 句用のプレースホルダを返す
@@ -746,10 +815,7 @@ async function billingReportsByCompetitions(
 // テナントの課金額を計算する
 async function tenantBilling(tenant: TenantRow): Promise<TenantWithBilling> {
   const reports = await withTenantDB(tenant.id, async (tenantDB) => {
-    const competitions = await tenantDB.all<CompetitionRow[]>(
-      'SELECT * FROM competition WHERE tenant_id = ?',
-      tenant.id
-    )
+    const competitions = await listCompetitions(tenantDB, tenant.id)
     return billingReportsByCompetitions(tenantDB, tenant.id, competitions)
   })
 
@@ -910,9 +976,11 @@ app.post(
         )
       } catch (error) {
         throw new Error(`error Update player: isDisqualified=true, updatedAt=${now}, id=${playerId}, ${error}`)
+      } finally {
+        playerCache.invalidate(`${viewer.tenantId}:${playerId}`)
       }
 
-      return retrievePlayer(tenantDB, playerId)
+      return retrievePlayer(tenantDB, viewer.tenantId, playerId)
     })
     if (!player) {
       // 存在しないプレイヤー
@@ -960,6 +1028,8 @@ app.post(
       throw new Error(
         `error Insert competition: id=${id}, tenant_id=${viewer.tenantId}, title=${title}, finishedAt=null, createdAt=${now}, updatedAt=${now}, ${error}`
       )
+    } finally {
+      invalidateCompetitions(viewer.tenantId)
     }
 
     const data: CompetitionsAddResult = {
@@ -992,14 +1062,18 @@ app.post(
 
     const now = unixNow()
     await withTenantDB(viewer.tenantId, async (tenantDB) => {
-      const competition = await retrieveCompetition(tenantDB, competitionId)
+      const competition = await retrieveCompetition(tenantDB, viewer.tenantId, competitionId)
       if (!competition) {
         throw new ErrorWithStatus(404, 'competition not found')
       }
 
-      await withTenantWriteLock(viewer.tenantId, () =>
-        tenantDB.run('UPDATE competition SET finished_at = ?, updated_at = ? WHERE id = ?', now, now, competitionId)
-      )
+      try {
+        await withTenantWriteLock(viewer.tenantId, () =>
+          tenantDB.run('UPDATE competition SET finished_at = ?, updated_at = ? WHERE id = ?', now, now, competitionId)
+        )
+      } finally {
+        invalidateCompetitions(viewer.tenantId, competitionId)
+      }
     })
 
     res.status(200).json({
@@ -1051,7 +1125,7 @@ async function saveCompetitionScores(
   competitionId: string,
   tenantDB: Database
 ): Promise<number | undefined> {
-  const competition = await retrieveCompetition(tenantDB, competitionId)
+  const competition = await retrieveCompetition(tenantDB, viewer.tenantId, competitionId)
   if (!competition) {
     throw new ErrorWithStatus(404, 'competition not found')
   }
@@ -1142,6 +1216,7 @@ async function saveCompetitionScores(
     }
   })
   invalidateRanking(viewer.tenantId, competitionId)
+  playerScoresCache.invalidate(viewer.tenantId)
 
   return rows.length
 }
@@ -1192,6 +1267,77 @@ app.get(
   })
 )
 
+// テナント単位でまとめて破棄するキャッシュ
+// 読み込み開始時点のテナントのキャッシュに保存するので、読み込み中に破棄された場合は古い値が使われることはない
+class TenantScopedCache<V> {
+  private caches = new Map<number, Map<string, V>>()
+
+  async get(tenantId: number, key: string, load: () => Promise<V>): Promise<V> {
+    let cache = this.caches.get(tenantId)
+    if (!cache) {
+      cache = new Map()
+      this.caches.set(tenantId, cache)
+    }
+    const cached = cache.get(key)
+    if (cached !== undefined) {
+      return cached
+    }
+
+    const value = await load()
+    cache.set(key, value)
+    return value
+  }
+
+  invalidate(tenantId: number) {
+    this.caches.delete(tenantId)
+  }
+
+  clear() {
+    this.caches.clear()
+  }
+}
+
+// 参加者ごとの大会のスコア一覧のキャッシュ
+// スコアの入稿でのみ変わる(大会の追加・終了では変わらない)ので、入稿時にテナント単位で破棄する
+const playerScoresCache = new TenantScopedCache<PlayerScoreDetail[]>()
+
+// 参加者の大会ごとのスコアを、大会の作成日時順に返す
+async function computePlayerScores(
+  tenantDB: Database,
+  tenantId: number,
+  playerId: string
+): Promise<PlayerScoreDetail[]> {
+  const competitions = await listCompetitions(tenantDB, tenantId, 'ASC')
+  const pss = await tenantDB.all<PlayerScoreRow[]>(
+    'SELECT competition_id, score, row_num FROM player_score WHERE tenant_id = ? AND player_id = ?',
+    tenantId,
+    playerId
+  )
+
+  // 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
+  const latestScores = new Map<string, PlayerScoreRow>()
+  for (const ps of pss) {
+    const latest = latestScores.get(ps.competition_id)
+    if (!latest || latest.row_num < ps.row_num) {
+      latestScores.set(ps.competition_id, ps)
+    }
+  }
+
+  const psds: PlayerScoreDetail[] = []
+  for (const comp of competitions) {
+    const ps = latestScores.get(comp.id)
+    if (!ps) {
+      // 行がない = スコアが記録されてない
+      continue
+    }
+    psds.push({
+      competition_title: comp.title,
+      score: ps.score,
+    })
+  }
+  return psds
+}
+
 // 参加者向けAPI
 // GET /api/player/player/:playerId
 // 参加者の詳細情報を取得する
@@ -1205,47 +1351,19 @@ app.get(
       throw new ErrorWithStatus(400, 'player_id is required')
     }
 
-    const [p, competitions, pss] = await withTenantDB(viewer.tenantId, async (tenantDB) => {
-      await authorizePlayer(tenantDB, viewer.playerId)
+    const [p, psds] = await withTenantDB(viewer.tenantId, async (tenantDB) => {
+      await authorizePlayer(tenantDB, viewer.tenantId, viewer.playerId)
 
-      const p = await retrievePlayer(tenantDB, playerId)
+      const p = await retrievePlayer(tenantDB, viewer.tenantId, playerId)
       if (!p) {
         throw new ErrorWithStatus(404, 'player not found')
       }
 
-      const competitions = await tenantDB.all<CompetitionRow[]>(
-        'SELECT * FROM competition WHERE tenant_id = ? ORDER BY created_at ASC',
-        viewer.tenantId
+      const psds = await playerScoresCache.get(viewer.tenantId, p.id, () =>
+        computePlayerScores(tenantDB, viewer.tenantId, p.id)
       )
-      const pss = await tenantDB.all<PlayerScoreRow[]>(
-        'SELECT competition_id, score, row_num FROM player_score WHERE tenant_id = ? AND player_id = ?',
-        viewer.tenantId,
-        p.id
-      )
-      return [p, competitions, pss] as const
+      return [p, psds] as const
     })
-
-    // 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
-    const latestScores = new Map<string, PlayerScoreRow>()
-    for (const ps of pss) {
-      const latest = latestScores.get(ps.competition_id)
-      if (!latest || latest.row_num < ps.row_num) {
-        latestScores.set(ps.competition_id, ps)
-      }
-    }
-
-    const psds: PlayerScoreDetail[] = []
-    for (const comp of competitions) {
-      const ps = latestScores.get(comp.id)
-      if (!ps) {
-        // 行がない = スコアが記録されてない
-        continue
-      }
-      psds.push({
-        competition_title: comp.title,
-        score: ps.score,
-      })
-    }
 
     const data: PlayerResult = {
       player: toPlayerDetail(p),
@@ -1259,29 +1377,21 @@ app.get(
 )
 
 // 大会ごとのランキング(全順位)のキャッシュ
-// スコアの入稿でのみ変わるので、入稿時に世代を進めて無効化する
-// 計算中に入稿が挟まった場合は古い結果をキャッシュしないよう、計算開始時の世代と比較する
-const rankingCache = new Map<string, CompetitionRank[]>()
-const rankingGenerations = new Map<string, number>()
-
-function rankingKey(tenantId: number, competitionId: string): string {
-  return `${tenantId}:${competitionId}`
-}
+// スコアの入稿でのみ変わるので、入稿時に invalidate する
+const rankingCache = new VersionedCache<CompetitionRank[]>()
 
 function invalidateRanking(tenantId: number, competitionId: string) {
-  const key = rankingKey(tenantId, competitionId)
-  rankingGenerations.set(key, (rankingGenerations.get(key) ?? 0) + 1)
-  rankingCache.delete(key)
+  rankingCache.invalidate(`${tenantId}:${competitionId}`)
 }
 
 async function fetchRanking(tenantDB: Database, tenantId: number, competitionId: string): Promise<CompetitionRank[]> {
-  const key = rankingKey(tenantId, competitionId)
-  const cached = rankingCache.get(key)
-  if (cached) {
-    return cached
-  }
-  const generation = rankingGenerations.get(key) ?? 0
+  const ranks = await rankingCache.get(`${tenantId}:${competitionId}`, () =>
+    computeRanking(tenantDB, tenantId, competitionId)
+  )
+  return ranks ?? []
+}
 
+async function computeRanking(tenantDB: Database, tenantId: number, competitionId: string): Promise<CompetitionRank[]> {
   // 最後にCSVに登場したスコアを採用する = 参加者ごとに row_num が一番大きいもの
   // (SQLite では MAX() と同時に取得した列は MAX() を取った行の値になる)
   const tmpRanks = await tenantDB.all<(CompetitionRank & { row_num: number })[]>(
@@ -1301,17 +1411,34 @@ async function fetchRanking(tenantDB: Database, tenantId: number, competitionId:
     return a.score > b.score ? -1 : 1
   })
 
-  const ranks = tmpRanks.map((rank, index) => ({
+  return tmpRanks.map((rank, index) => ({
     rank: index + 1,
     score: rank.score,
     player_id: rank.player_id,
     player_display_name: rank.player_display_name,
   }))
+}
 
-  if ((rankingGenerations.get(key) ?? 0) === generation) {
-    rankingCache.set(key, ranks)
+// ランキングへのアクセスを記録する
+// 課金計算では (テナント, 大会, 参加者) ごとの最初のアクセス時刻しか使わないので、
+// このプロセスで記録済みの組み合わせは INSERT しない (同時に来た場合は先の INSERT の完了を待つ)
+const recordedVisits = new Map<string, Promise<void>>()
+
+async function recordVisit(tenantId: number, competitionId: string, playerId: string): Promise<void> {
+  const key = `${tenantId}:${competitionId}:${playerId}`
+  let recorded = recordedVisits.get(key)
+  if (!recorded) {
+    const now = unixNow()
+    recorded = adminDB
+      .execute<OkPacket>(
+        'INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+        [playerId, tenantId, competitionId, now, now]
+      )
+      .then(() => undefined)
+    recordedVisits.set(key, recorded)
+    recorded.catch(() => recordedVisits.delete(key))
   }
-  return ranks
+  await recorded
 }
 
 // 参加者向けAPI
@@ -1336,18 +1463,14 @@ app.get(
     const start = Math.max(rankAfter, 0)
 
     const [competition, allRanks] = await withTenantDB(viewer.tenantId, async (tenantDB) => {
-      await authorizePlayer(tenantDB, viewer.playerId)
+      await authorizePlayer(tenantDB, viewer.tenantId, viewer.playerId)
 
-      const competition = await retrieveCompetition(tenantDB, competitionId)
+      const competition = await retrieveCompetition(tenantDB, viewer.tenantId, competitionId)
       if (!competition) {
         throw new ErrorWithStatus(404, 'competition not found')
       }
 
-      const now = unixNow()
-      await adminDB.execute<OkPacket>(
-        'INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
-        [viewer.playerId, viewer.tenantId, competitionId, now, now]
-      )
+      await recordVisit(viewer.tenantId, competitionId, viewer.playerId)
 
       return [competition, await fetchRanking(tenantDB, viewer.tenantId, competition.id)] as const
     })
@@ -1372,7 +1495,7 @@ app.get(
     const viewer = await parseViewerWithRole(req, RolePlayer, 'role player required')
 
     const competitions = await withTenantDB(viewer.tenantId, async (tenantDB) => {
-      await authorizePlayer(tenantDB, viewer.playerId)
+      await authorizePlayer(tenantDB, viewer.tenantId, viewer.playerId)
       return listCompetitions(tenantDB, viewer.tenantId)
     })
     competitionsHandler(res, competitions)
@@ -1409,7 +1532,9 @@ app.get(
       })
     }
 
-    const p = await withTenantDB(viewer.tenantId, (tenantDB) => retrievePlayer(tenantDB, viewer.playerId))
+    const p = await withTenantDB(viewer.tenantId, (tenantDB) =>
+      retrievePlayer(tenantDB, viewer.tenantId, viewer.playerId)
+    )
     if (!p) {
       const data: MeResult = {
         tenant: td,
@@ -1437,6 +1562,20 @@ app.get(
   })
 )
 
+// プロセス内に持っている状態(テナントDBへの接続・キャッシュ・ID の払い出し範囲)を破棄する
+async function resetInProcessState(): Promise<void> {
+  await closeIdleTenantDBs()
+  tenantCache.clear()
+  billingReportCache.clear()
+  rankingCache.clear()
+  playerScoresCache.clear()
+  playerCache.clear()
+  competitionCache.clear()
+  competitionListCache.clear()
+  recordedVisits.clear()
+  resetIDBlock()
+}
+
 // ベンチマーカー向けAPI
 // POST /initialize
 // ベンチマーカーが起動したときに最初に呼ぶ
@@ -1446,13 +1585,11 @@ app.post(
   wrap(async (req: Request, res: Response, _next: NextFunction) => {
     try {
       // テナントDBのファイルを置き換えるので、開いている接続とプロセス内のキャッシュを破棄する
-      await closeIdleTenantDBs()
-      tenantCache.clear()
-      billingReportCache.clear()
-      rankingCache.clear()
-      rankingGenerations.clear()
+      // 初期化中も前回のベンチマークのリクエストが処理されていることがあり、置き換え前のファイルへの接続や
+      // 古いデータのキャッシュが作られうるので、初期化の後にももう一度破棄する
+      await resetInProcessState()
       await exec(initializeScript)
-      resetIDBlock()
+      await resetInProcessState()
 
       const data: InitializeResult = {
         lang: 'node',
