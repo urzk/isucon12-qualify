@@ -1,5 +1,7 @@
 package "sqlite3"
 package "docker.io"
+# docker.io の更新に追従できるよう、compose も Ubuntu のパッケージを使う
+package "docker-compose-v2"
 package "build-essential"
 
 file "/etc/hosts" do

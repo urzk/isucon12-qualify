@@ -45,22 +45,3 @@ file "/home/isucon/.hushlogin" do
   mode "0600"
   content ""
 end
-
-directory "/home/isucon/.docker" do
-  owner "isucon"
-  group "isucon"
-  mode "0755"
-end
-
-directory "/home/isucon/.docker/cli-plugins" do
-  owner "isucon"
-  group "isucon"
-  mode "0755"
-end
-
-http_request "/home/isucon/.docker/cli-plugins/docker-compose" do
-  url "https://github.com/docker/compose/releases/download/v2.6.1/docker-compose-linux-x86_64"
-  owner "isucon"
-  group "isucon"
-  mode "0755"
-end
