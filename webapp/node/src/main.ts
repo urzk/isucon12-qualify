@@ -438,7 +438,8 @@ async function flockByTenantID(tenantId: number): Promise<() => Promise<void>> {
     try {
       await flock(fd, fsExt.constants.LOCK_EX | fsExt.constants.LOCK_NB)
     } catch (error: any) {
-      if (error.code === 'EAGAIN' && error.errno === 11) {
+      // errno の値は OS ごとに異なる (Linux: 11, macOS: 35) ので code で判定する
+      if (error.code === 'EAGAIN') {
         await asyncSleep(10)
         continue
       }
