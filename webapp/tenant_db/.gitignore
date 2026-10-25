@@ -1,2 +1,5 @@
 *.db
 *.lock
+template/
+*.db-wal
+*.db-shm
