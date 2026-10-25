@@ -15,6 +15,10 @@ git fetch origin "$BRANCH"
 git checkout -q "$BRANCH"
 git reset -q --hard "origin/$BRANCH"
 git log --oneline -1
+# 実行中のこのスクリプト自体も pull で更新されうるので、更新後の内容で実行し直す
+if [ -z "${DEPLOY_REEXEC:-}" ]; then
+  DEPLOY_REEXEC=1 exec "$REPO/deploy/deploy.sh" "$BRANCH"
+fi
 
 echo "==> sync webapp / public"
 # tenant_db (SQLite の実データ) と node_modules はサーバー上のものを残す
