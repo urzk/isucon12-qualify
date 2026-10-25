@@ -24,7 +24,8 @@ rsync -a --delete \
 rsync -a --delete "$REPO/public/" "$HOME_DIR/public/"
 
 echo "==> nginx"
-# AMI の nginx 設定はこのファイルから作られているので、ここを編集して反映する
+# AMI の nginx 設定はこれらのファイルから作られているので、ここを編集して反映する
+sudo install -m 0644 "$REPO/provisioning/mitamae/cookbooks/nginx/nginx.conf" /etc/nginx/nginx.conf
 sudo install -m 0644 "$REPO/provisioning/mitamae/cookbooks/nginx/isuports.conf" /etc/nginx/sites-available/isuports.conf
 sudo nginx -t
 sudo systemctl reload nginx

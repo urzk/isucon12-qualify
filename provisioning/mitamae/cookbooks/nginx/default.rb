@@ -1,5 +1,12 @@
 package "nginx"
 
+remote_file "/etc/nginx/nginx.conf" do
+  owner "root"
+  group "root"
+  mode "0644"
+  source "nginx.conf"
+end
+
 remote_file "/etc/nginx/sites-available/isuports.conf" do
   owner "root"
   group "root"
