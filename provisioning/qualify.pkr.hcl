@@ -1,3 +1,12 @@
+packer {
+  required_plugins {
+    amazon = {
+      version = ">= 1.2.0"
+      source  = "github.com/hashicorp/amazon"
+    }
+  }
+}
+
 variable "revision" {
   type    = string
   default = "unknown"
@@ -22,13 +31,14 @@ locals {
 
 data "amazon-ami" "ubuntu-jammy" {
   filters = {
-    name                = "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+    name                = "ubuntu/images/hvm-ssd*/ubuntu-jammy-22.04-amd64-server-*"
     root-device-type    = "ebs"
     virtualization-type = "hvm"
   }
-  most_recent = true
-  owners      = ["099720109477"]
-  region      = "ap-northeast-1"
+  most_recent        = true
+  include_deprecated = true
+  owners             = ["099720109477"]
+  region             = "ap-northeast-1"
 }
 
 source "amazon-ebs" "qualify" {

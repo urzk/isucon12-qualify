@@ -2,6 +2,7 @@ export BRANCH := $(shell git branch --contains | fgrep '*' | cut -d ' ' -f 2)
 
 .PHONY: build clean
 build: isucon12-qualify mitamae.tar.gz
+	packer init qualify.pkr.hcl
 	packer build qualify.pkr.hcl
 
 blackauth:
